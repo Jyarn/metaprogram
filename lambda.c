@@ -64,9 +64,10 @@ typedef struct
     const char *data;
 } String;
 
-typedef struct
+typedef struct Lambda
 {
     String return_type, function_args, function_body, raw_lambda;
+    struct Lambda *next;
 } Lambda;
 
 
@@ -133,6 +134,7 @@ parse_lambda(const char *lambda_start, Lambda *lambda_out)
 {
     if (strncmp(lambda_start, "lambda", 6)) return false;
     lambda_out->raw_lambda.data = lambda_start;
+    lambda_out->raw_lambda.size = 0;
     lambda_start = find_next_non_whitespace_character(lambda_start + 6);
     if (lambda_start)
 
@@ -160,6 +162,7 @@ parse_lambda(const char *lambda_start, Lambda *lambda_out)
     }
 
     assert(num_left_parentheses == num_right_parentheses);
+    lambda_out->raw_lambda.size = lambda_size + 7;
 
 
     // Parse return type
@@ -210,7 +213,7 @@ parse_lambda(const char *lambda_start, Lambda *lambda_out)
     if (comma_after_function_body_end_offset != -1)
     {
         comma_after_function_body_end_ptr += comma_after_function_body_end_offset;
-        if (comma_after_function_body_end_ptr > lambda_out->function_body.data + lambda_out->function_body.size)
+        if (comma_after_function_body_end_ptr < lambda_out->function_body.data + lambda_out->function_body.size)
             return false;
     }
 
@@ -228,15 +231,18 @@ parse_lambda(const char *lambda_start, Lambda *lambda_out)
     {
         const char *function_args_end = lambda_out->function_args.data;
         function_args_end += lambda_out->function_args.size;
-        if (function_args_end >= lambda_out->function_body.data)
-            break;
 
         long long next_comma_offset = find_next_matching_character(
             function_args_end,
             ','
         );
+
         if (next_comma_offset == -1)
             break;
+
+        if (function_args_end + next_comma_offset + 1 >= lambda_out->function_body.data)
+            break;
+
         lambda_out->function_args.size += next_comma_offset + 1;
     }
 
@@ -248,11 +254,48 @@ parse_lambda(const char *lambda_start, Lambda *lambda_out)
     return true;
 }
 
+static inline char
+chunk_to_b64(unsigned char c)
+{
+    if (c < 10) return c + '0';
+    else if (c < 36) return c - 10 + 'A';
+    else if (c < 62) return c - 36 + 'a';
+    else if (c == 62) return '_';
+    else if (c == 63) return '$';
+    assert(false);
+}
+
+static void
+format_lambda(Lambda lambda, size_t function_id)
+{
+    char function_id_base64[11];
+    function_id_base64[10] = chunk_to_b64(function_id & 0x3F);
+    function_id_base64[9] = chunk_to_b64((function_id >>= 6) & 0x3F);
+    function_id_base64[8] = chunk_to_b64((function_id >>= 6) & 0x3F);
+    function_id_base64[7] = chunk_to_b64((function_id >>= 6) & 0x3F);
+    function_id_base64[6] = chunk_to_b64((function_id >>= 6) & 0x3F);
+    function_id_base64[5] = chunk_to_b64((function_id >>= 6) & 0x3F);
+    function_id_base64[4] = chunk_to_b64((function_id >>= 6) & 0x3F);
+    function_id_base64[3] = chunk_to_b64((function_id >>= 6) & 0x3F);
+    function_id_base64[2] = chunk_to_b64((function_id >>= 6) & 0x3F);
+    function_id_base64[1] = chunk_to_b64((function_id >>= 6) & 0x3F);
+    function_id_base64[0] = chunk_to_b64((function_id >>= 6) & 0x3F);
+
+    printf("static %.*s\n", lambda.return_type.size, lambda.return_type.data);
+    printf("lambda%.11s(%.*s)\n", function_id_base64, lambda.function_args.size, lambda.function_args.data);
+    printf("%.*s\n", lambda.function_body.size, lambda.function_body.data);
+}
+
 int
 main(int argc, const char *argv[argc])
 {
     String file;
     //assert(argc == 2 && "Bad args.");
+
+    struct
+    {
+        Lambda *head, *tail;
+    } lambdas;
 
     int fd = open("./test.txt", O_RDWR);
     assert(fd > 2 && "Failed to open input file.");
@@ -266,12 +309,40 @@ main(int argc, const char *argv[argc])
     buffer[file_stats.st_size] = '\0';
     file.data = buffer;
 
-    Lambda lambda;
-    assert(parse_lambda(file.data, &lambda));
+    size_t lambda_id = 0;
+    const char *next_potential_lambda = file.data;
 
-    printf("%.*s\n", (int) lambda.return_type.size, lambda.return_type.data);
-    printf("new_function(%.*s)\n", (int) lambda.function_args.size, lambda.function_args.data);
-    printf("%.*s\n", (int) lambda.function_body.size, lambda.function_body.data);
+    size_t old_lambda_total_size, new_lambda_total_size;
+    old_lambda_total_size = new_lambda_total_size = 0;
+    while (true)
+    {
+        next_potential_lambda = find_next_keyword_that_has_no_repeating_characters(
+            next_potential_lambda,
+            "lambda"
+        );
+        if (next_potential_lambda == NULL) break;
+
+        Lambda lambda;
+        if (parse_lambda(next_potential_lambda, &lambda))
+        {
+            format_lambda(lambda, lambda_id++);
+
+            old_lambda_total_size += lambda.raw_lambda.size;
+
+            new_lambda_total_size += lambda.return_type.size;
+            new_lambda_total_size += lambda.function_args.size;
+            new_lambda_total_size += lambda.function_body.size;
+        }
+
+        if (lambda.raw_lambda.size != 0)
+        {
+            next_potential_lambda += lambda.raw_lambda.size;
+        }
+        else
+        {
+            next_potential_lambda += 6;
+        }
+    }
 
     free(buffer);
 }
