@@ -58,6 +58,19 @@ exit 0
 #include <stdio.h>
 #include <ctype.h>
 
+#include <stdint.h>
+#include <stdbool.h>
+typedef int64_t i64;
+typedef uint64_t u64;
+typedef int32_t i32;
+typedef uint32_t u32;
+typedef uint16_t u16;
+typedef int16_t i16;
+typedef float f32;
+typedef double f64;
+typedef uint8_t u8;
+
+#define FILE_BUFFER_SIZE 4088
 typedef struct
 {
     long long size;
@@ -70,6 +83,18 @@ typedef struct Lambda
     struct Lambda *next;
 } Lambda;
 
+typedef struct
+{
+    size_t total_size;
+    size_t last_chunk_size;
+    struct StringBuilderNode
+    {
+        char data[FILE_BUFFER_SIZE];
+        struct StringBuilderNode *next;
+    } *head, *tail;
+} StringBuilder;
+
+typedef struct StringBuilderNode StringBuilderNode;
 
 static const char *
 find_next_keyword_that_has_no_repeating_characters(const char *file_data, const char *keyword)
@@ -254,36 +279,69 @@ parse_lambda(const char *lambda_start, Lambda *lambda_out)
     return true;
 }
 
-static inline char
-chunk_to_b64(unsigned char c)
-{
-    if (c < 10) return c + '0';
-    else if (c < 36) return c - 10 + 'A';
-    else if (c < 62) return c - 36 + 'a';
-    else if (c == 62) return '_';
-    else if (c == 63) return '$';
-    assert(false);
-}
-
 static void
-format_lambda(Lambda lambda, size_t function_id)
+append_string(StringBuilder *string_builder, const char *src_str, size_t src_len)
 {
-    char function_id_base64[11];
-    function_id_base64[10] = chunk_to_b64(function_id & 0x3F);
-    function_id_base64[9] = chunk_to_b64((function_id >>= 6) & 0x3F);
-    function_id_base64[8] = chunk_to_b64((function_id >>= 6) & 0x3F);
-    function_id_base64[7] = chunk_to_b64((function_id >>= 6) & 0x3F);
-    function_id_base64[6] = chunk_to_b64((function_id >>= 6) & 0x3F);
-    function_id_base64[5] = chunk_to_b64((function_id >>= 6) & 0x3F);
-    function_id_base64[4] = chunk_to_b64((function_id >>= 6) & 0x3F);
-    function_id_base64[3] = chunk_to_b64((function_id >>= 6) & 0x3F);
-    function_id_base64[2] = chunk_to_b64((function_id >>= 6) & 0x3F);
-    function_id_base64[1] = chunk_to_b64((function_id >>= 6) & 0x3F);
-    function_id_base64[0] = chunk_to_b64((function_id >>= 6) & 0x3F);
+    assert(src_len != 0);
+    StringBuilderNode *last_chunk = string_builder->tail;
+    if (!last_chunk)
+    {
+        last_chunk = malloc(sizeof(StringBuilderNode));
+        last_chunk->next = NULL;
 
-    printf("static %.*s\n", lambda.return_type.size, lambda.return_type.data);
-    printf("lambda%.11s(%.*s)\n", function_id_base64, lambda.function_args.size, lambda.function_args.data);
-    printf("%.*s\n", lambda.function_body.size, lambda.function_body.data);
+        string_builder->head = string_builder->tail = last_chunk;
+        string_builder->last_chunk_size = 0;
+    }
+
+    if (FILE_BUFFER_SIZE - string_builder->last_chunk_size >= src_len)
+    {
+        memcpy(
+            &last_chunk->data[string_builder->last_chunk_size],
+            src_str,
+            src_len
+        );
+        string_builder->last_chunk_size = string_builder->last_chunk_size + src_len;
+    }
+    else
+    {
+        memcpy(
+            &last_chunk->data[string_builder->last_chunk_size],
+            src_str,
+            FILE_BUFFER_SIZE - string_builder->last_chunk_size
+        );
+        src_str += FILE_BUFFER_SIZE - string_builder->last_chunk_size;
+        src_len -= FILE_BUFFER_SIZE - string_builder->last_chunk_size;
+
+        while (src_len > FILE_BUFFER_SIZE)
+        {
+            assert(string_builder->head);
+            assert(string_builder->tail);
+
+            last_chunk = malloc(sizeof(StringBuilderNode));
+            last_chunk->next = NULL;
+
+            string_builder->tail->next = last_chunk;
+            string_builder->tail = last_chunk;
+
+            memcpy(last_chunk->data, src_str, FILE_BUFFER_SIZE);
+            src_str += FILE_BUFFER_SIZE;
+            src_len -= FILE_BUFFER_SIZE;
+        }
+
+        assert(string_builder->head);
+        assert(string_builder->tail);
+
+        last_chunk = malloc(sizeof(StringBuilderNode));
+        last_chunk->next = NULL;
+
+        string_builder->tail->next = last_chunk;
+        string_builder->tail = last_chunk;
+
+        memcpy(last_chunk->data, src_str, src_len);
+        string_builder->last_chunk_size = src_len;
+    }
+
+    string_builder->total_size += src_len;
 }
 
 int
@@ -292,12 +350,7 @@ main(int argc, const char *argv[argc])
     String file;
     //assert(argc == 2 && "Bad args.");
 
-    struct
-    {
-        Lambda *head, *tail;
-    } lambdas;
-
-    int fd = open("./test.txt", O_RDWR);
+    int fd = open("test.meta.c", O_RDWR);
     assert(fd > 2 && "Failed to open input file.");
 
     struct stat file_stats;
@@ -310,10 +363,19 @@ main(int argc, const char *argv[argc])
     file.data = buffer;
 
     size_t lambda_id = 0;
-    const char *next_potential_lambda = file.data;
+    const char *lambda_include_ptr =
+        find_next_keyword_that_has_no_repeating_characters(
+            file.data,
+            "#include \"lambda.h\""
+        );
+    assert(lambda_include_ptr);
 
-    size_t old_lambda_total_size, new_lambda_total_size;
-    old_lambda_total_size = new_lambda_total_size = 0;
+    const char *next_potential_lambda = lambda_include_ptr;
+    const char *end_of_last_lambda_ptr = lambda_include_ptr;
+
+    StringBuilder lambdas_text = { 0 };
+    StringBuilder after_lambdas_text = { 0 };
+
     while (true)
     {
         next_potential_lambda = find_next_keyword_that_has_no_repeating_characters(
@@ -325,13 +387,46 @@ main(int argc, const char *argv[argc])
         Lambda lambda;
         if (parse_lambda(next_potential_lambda, &lambda))
         {
-            format_lambda(lambda, lambda_id++);
+            // Print lambda
+            append_string(&lambdas_text, "static ", 7);
+            append_string(&lambdas_text, lambda.return_type.data, lambda.return_type.size);
+            append_string(&lambdas_text, "\n", 1);
 
-            old_lambda_total_size += lambda.raw_lambda.size;
+            char new_lambda_name[20] = { "lambda_" };
 
-            new_lambda_total_size += lambda.return_type.size;
-            new_lambda_total_size += lambda.function_args.size;
-            new_lambda_total_size += lambda.function_body.size;
+            int i = 7;
+            int temp_lambda_id = lambda_id;
+            while (temp_lambda_id)
+            {
+                new_lambda_name[i++] = temp_lambda_id % 10 + '0';
+                temp_lambda_id /= 10;
+            }
+
+            if (i == 7)
+            {
+                new_lambda_name[7] = '0';
+                i = 8;
+            }
+            append_string(&lambdas_text, new_lambda_name, i);
+            append_string(&lambdas_text, "(", 1);
+            append_string(&lambdas_text, lambda.function_args.data, lambda.function_args.size);
+            append_string(&lambdas_text, ")\n", 2);
+
+            append_string(&lambdas_text, lambda.function_body.data, lambda.function_body.size);
+            append_string(&lambdas_text, "\n\n", 2);
+
+            lambda_id += 1;
+
+
+            // Print the rest
+            assert(lambda.raw_lambda.data >= end_of_last_lambda_ptr);
+            append_string(
+                &after_lambdas_text,
+                end_of_last_lambda_ptr,
+                lambda.raw_lambda.data - end_of_last_lambda_ptr
+            );
+            append_string(&after_lambdas_text, new_lambda_name, i);
+            end_of_last_lambda_ptr = lambda.raw_lambda.data + lambda.raw_lambda.size;
         }
 
         if (lambda.raw_lambda.size != 0)
@@ -344,5 +439,35 @@ main(int argc, const char *argv[argc])
         }
     }
 
+    assert(end_of_last_lambda_ptr >= file.data);
+    assert(file_stats.st_size >= end_of_last_lambda_ptr - file.data);
+    append_string(
+        &after_lambdas_text,
+        end_of_last_lambda_ptr,
+        file_stats.st_size - (end_of_last_lambda_ptr - file.data)
+    );
+
+    int outfile_fd =
+        open("test.c", O_WRONLY | O_TRUNC | O_CREAT, file_stats.st_mode);
+
+    write(outfile_fd, file.data, lambda_include_ptr - file.data);
+
+    for (StringBuilderNode *node = lambdas_text.head; node; node = node->next)
+    {
+        if (node->next)
+            write(outfile_fd, node->data, FILE_BUFFER_SIZE);
+        else
+            write(outfile_fd, node->data, lambdas_text.last_chunk_size);
+    }
+
+    for (StringBuilderNode *node = after_lambdas_text.head; node; node = node->next)
+    {
+        if (node->next)
+            write(outfile_fd, node->data, FILE_BUFFER_SIZE);
+        else
+            write(outfile_fd, node->data, after_lambdas_text.last_chunk_size);
+    }
+
+    close(outfile_fd);
     free(buffer);
 }
